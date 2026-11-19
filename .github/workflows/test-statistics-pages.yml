@@ -69,7 +69,7 @@ jobs:
       - name: Add Pages landing page
         run: cp src/site-index.html site/index.html
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pages-site
           path: site
@@ -81,7 +81,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: pages-site
           path: site

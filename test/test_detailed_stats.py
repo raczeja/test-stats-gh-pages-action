@@ -2,6 +2,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -113,12 +114,12 @@ class DetailedStatsTests(unittest.TestCase):
             dashboard = (site / "stats" / "index.html").read_text()
 
             self.assertIn(
-                '<div class="stat-box stat-fail"><div class="stat-val">1.5</div>'
+                '<div class="stat-box stat-fail"><div class="stat-val" id="overview-avg-failed">1.5</div>'
                 '<div class="stat-lbl">Avg failures/run</div></div>',
                 dashboard,
             )
             self.assertIn(
-                '<div class="stat-box stat-flaky"><div class="stat-val">1.5</div>'
+                '<div class="stat-box stat-flaky"><div class="stat-val" id="overview-avg-flaky">1.5</div>'
                 '<div class="stat-lbl">Avg passed after retry/run</div></div>',
                 dashboard,
             )
@@ -246,8 +247,9 @@ class DetailedStatsTests(unittest.TestCase):
             self.assertIn("sourceLabel(test)", dashboard)
             self.assertIn("Ocaramba.Tests.Features.xml", dashboard)
             self.assertIn("Test results (all configured sources)", dashboard)
+            self.assertIn('id="overview-avg-duration"', dashboard)
             self.assertIn(
-                '<div class="stat-box"><div class="stat-val">2</div>'
+                '<div class="stat-box"><div class="stat-val" id="overview-avg-total">2</div>'
                 '<div class="stat-lbl">Avg tests/run</div></div>',
                 dashboard,
             )
@@ -532,7 +534,7 @@ class DetailedStatsTests(unittest.TestCase):
             self.assertIn('<option value="1" selected>', dashboard)
             self.assertLess(
                 dashboard.index('id="run-picker"'),
-                dashboard.index('<h2 class="card-title">Last 30 days'),
+                dashboard.index('<h2 class="card-title" id="overview-title">Last 30 days'),
             )
             self.assertIn(
                 "picker.addEventListener('change',function(){renderRun(RUNS[parseInt(this.value,10)]);});",
@@ -669,6 +671,28 @@ class DetailedStatsTests(unittest.TestCase):
             shell_xml = root / "shell.xml"
             shell_xml.write_text('<testsuite name="shell"/>')
             site = root / "site"
+            stats = site / "stats"
+            stats.mkdir(parents=True)
+            now = dt.datetime.now(dt.timezone.utc)
+            (stats / "runs.json").write_text(json.dumps({"runs": [{
+                "run_id": "feature-run",
+                "run_url": "https://github.com/owner/repo/actions/runs/feature-run",
+                "branch": "feature/branch",
+                "timestamp": (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "total": 1,
+                "passed": 1,
+                "failed": 0,
+                "skipped": 0,
+                "flaky_count": 0,
+                "tests": [{
+                    "source": "Playwright",
+                    "source_file": "playwright.json",
+                    "title": "branch test",
+                    "file": "branch.spec.js",
+                    "duration_ms": 100,
+                    "status": "passed",
+                }],
+            }]}))
             env = os.environ.copy()
             env.update({
                 "RESULTS_DIR": str(results),
@@ -678,10 +702,14 @@ class DetailedStatsTests(unittest.TestCase):
                 "GITHUB_RUN_ID": "run-1",
                 "GITHUB_SERVER_URL": "https://github.com",
                 "GITHUB_REPOSITORY": "owner/repo",
+                "GITHUB_REF_NAME": "main",
             })
             subprocess.run(["bash", str(SCRIPT)], check=True, env=env, capture_output=True, text=True)
             dashboard = (site / "stats" / "index.html").read_text()
-            run = json.loads((site / "stats" / "runs.json").read_text())["runs"][0]
+            stored_runs = json.loads((site / "stats" / "runs.json").read_text())["runs"]
+            run = stored_runs[-1]
+            self.assertEqual(run["branch"], "main")
+            self.assertFalse(run["test_comparison_available"])
             node = shutil.which("node")
             if node is None:
                 self.skipTest("Node.js is required to exercise dashboard behavior")
@@ -689,6 +717,10 @@ class DetailedStatsTests(unittest.TestCase):
                 "<script>\n(function(){\n  var picker=document.getElementById('run-picker');"
             ) + len("<script>")
             script_end = dashboard.index("</script>", script_start)
+            trend_start = dashboard.index(
+                "<script>\n(function(){\n  var sel=document.getElementById('agg-picker');"
+            ) + len("<script>")
+            trend_end = dashboard.index("</script>", trend_start)
             result = subprocess.run(
                 [node, "-e", """
                     const { runInNewContext } = require('vm');
@@ -717,7 +749,11 @@ class DetailedStatsTests(unittest.TestCase):
                       return controls[id] || (controls[id] = {
                         innerHTML: '',
                         textContent: '',
-                        value: id === 'run-picker' ? '0' : (id === 'test-time-filter' ? 'all' : ''),
+                        className: '',
+                        style: {},
+                        value: id === 'branch-picker' ? 'all'
+                          : (id === 'run-picker' ? '0'
+                          : (id === 'test-time-filter' ? 'all' : (id === 'agg-picker' ? 'top' : ''))),
                         disabled: false,
                         listeners: {},
                         addEventListener(name, callback) { this.listeners[name] = callback; },
@@ -756,12 +792,19 @@ class DetailedStatsTests(unittest.TestCase):
                       pathname: '/owner/repo/stats/',
                       reload() { this.didReload = true; }
                     };
-                    runInNewContext(input.script, {
+                    const window = {};
+                    const context = {
                       document,
-                      RUNS: [input.run],
+                      RUNS: input.runs,
+                      FILTER_STATS: input.filterStats,
                       location,
+                      window,
+                      AGG: input.filterStats.all.agg,
                       Event: function Event(name) { this.type = name; }
-                    });
+                    };
+                    runInNewContext(input.script, context);
+                    runInNewContext(input.trendScript, context);
+                    window.initializeBranchDashboard();
                     const page = () => ({
                       titles: Array.from(control('all-tests-body').innerHTML.matchAll(/data-test-title="([^"]*)"/g),
                         match => match[1].replace(/&gt;/g, '>')),
@@ -811,16 +854,36 @@ class DetailedStatsTests(unittest.TestCase):
                     change.checked = false;
                     change.listener();
                     const noChange = page();
+                    const initialColumnHtml = control('selected-run-tests').innerHTML;
+                    const branchPicker = control('branch-picker');
+                    branchPicker.value = 'branch:feature/branch';
+                    branchPicker.listeners.change.call(branchPicker);
+                    const branchSummary = control('overview-title').textContent;
+                    const branchAverage = control('overview-avg-total').textContent;
+                    const branchRun = control('run-picker').value;
+                    const branchRange = control('run-page-range').textContent;
+                    const branchSparkline = control('run-sparkline').innerHTML;
+                    const aggPicker = control('agg-picker');
+                    aggPicker.value = 'flaky';
+                    aggPicker.listeners.change.call(aggPicker);
+                    const branchPrefs = JSON.parse(decodeURIComponent(
+                      document.cookie.split(';')[0].split('=').slice(1).join('=')));
                     control('reset-dashboard-preferences').listeners.click();
                     process.stdout.write(JSON.stringify({
                       first, second, third, previous, resized, sortedDescending, searched, slowOnly,
                       noSource, noStatus, noChange, prefs,
+                      branchSummary, branchAverage, branchRun, branchRange, branchSparkline, branchPrefs,
                       resetCookie: document.cookie, resetReloaded: location.didReload,
-                      columnHtml: control('selected-run-tests').innerHTML
+                      columnHtml: initialColumnHtml
                     }));
                 """, json.dumps({
                     "script": dashboard[script_start:script_end],
+                    "trendScript": dashboard[trend_start:trend_end],
                     "run": run,
+                    "runs": stored_runs,
+                    "filterStats": json.loads(
+                        re.search(r"var FILTER_STATS=(.*?);</script>", dashboard).group(1)
+                    ),
                 })],
                 check=False,
                 capture_output=True,
@@ -873,6 +936,13 @@ class DetailedStatsTests(unittest.TestCase):
             self.assertEqual(pages["noChange"]["range"], "Showing 0-0 of 0 tests")
             self.assertIn("Max-Age=0", pages["resetCookie"])
             self.assertTrue(pages["resetReloaded"])
+            self.assertEqual(pages["branchSummary"], "Last 30 days — 1 run(s)")
+            self.assertEqual(pages["branchAverage"], 1)
+            self.assertEqual(pages["branchRun"], "0")
+            self.assertEqual(pages["branchRange"], "Runs 1-1 of 1 (newest first)")
+            self.assertIn("feature-run", pages["branchSparkline"])
+            self.assertNotIn("Run #1", pages["branchSparkline"])
+            self.assertEqual(pages["branchPrefs"]["branch"], "branch:feature/branch")
 
     def test_records_shell_failure_when_playwright_results_are_unavailable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1105,6 +1175,7 @@ class DetailedStatsTests(unittest.TestCase):
                     runInNewContext(input.script, {
                       document,
                       AGG: input.trends,
+                      window: {},
                       location: { pathname: '/owner/repo/stats/' }
                     });
                     const highlighted = () => rows

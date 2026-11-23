@@ -86,10 +86,15 @@ It creates/updates:
 
 - `<stats-subdirectory>/runs.json` — normalized run history, pruned to the
   configured rolling window and deduplicated by GitHub run number. The file
-  includes `"schemaVersion": 1`; files from earlier releases without this field
+  records each run's branch from `GITHUB_HEAD_REF` when available (for pull
+  requests), otherwise from `GITHUB_REF_NAME`; older runs without branch
+  metadata remain available under
+  **Unknown branch**. It includes `"schemaVersion": 1`; files from earlier
+  releases without this field
   are treated as legacy schema version 1 and upgraded in place. Unsupported
   schema versions fail explicitly instead of risking a silent format mismatch.
-- `<stats-subdirectory>/index.html` — a small static recent-run table.
+- `<stats-subdirectory>/index.html` — a small static recent-run table including
+  the branch for each run.
 - `$GITHUB_STEP_SUMMARY` with test counts and a link to the published dashboard
   when its Pages URL is available; plus action outputs `total`, `passed`,
   `failed`, `skipped`, and `stats-file`.
@@ -97,8 +102,13 @@ It creates/updates:
   per-test dashboard, including average failures and flaky tests per run across
   eligible runs. It lists all tests captured by
   the selected run (the newest run by default), with a selector at the top of
-  the dashboard, including each test's execution time when the result file
-  provides it. The Source column shows the imported result filename. The Test,
+  the dashboard. The **Branch** selector defaults to **All branches** and
+  filters the run list, headline statistics, test trends, and run history; the
+  selected branch is remembered with the other dashboard preferences. Switching
+  branches selects that branch's latest run, and test changes are compared with
+  the previous run on the same branch. The selected run lists each test's
+  execution time when available. The Source column shows the imported result
+  filename. The Test,
   Source, Status, Execution time, and Change columns can be
   sorted by clicking their headers. The default order puts failed tests first,
   then flaky tests, then new and changed tests, with test name as the tie-breaker.
@@ -279,6 +289,8 @@ The `.github/workflows/test-statistics-pages.yml` workflow runs the test suite
 and publishes its JUnit XML results to this repository's `gh-pages` branch on
 pushes to `main` and manual runs from `main`. Pull requests build the dashboard
 but do not publish it. Its build job summary links to the published dashboard.
+The branch selector can only show branches whose runs are present in the shared
+history; this workflow currently publishes only `main`.
 The first successful workflow run on `main` creates
 `gh-pages`; you do not need to create it manually. Then enable Pages in
 **Settings → Pages** with `gh-pages` and the root (`/`) folder; the dashboard

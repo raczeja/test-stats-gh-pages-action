@@ -36,6 +36,7 @@ repository_name = os.environ.get("GITHUB_REPOSITORY", "").rsplit("/", 1)[-1].str
 dashboard_name  = " · ".join(name for name in (repository_name, report_name) if name)
 dashboard_name  = dashboard_name or "Test results"
 run_number      = os.environ.get("GITHUB_RUN_NUMBER", "0")
+branch_name     = os.environ.get("GITHUB_HEAD_REF") or os.environ.get("GITHUB_REF_NAME", "")
 run_url         = "{}/{}/actions/runs/{}".format(
     os.environ.get("GITHUB_SERVER_URL", "https://github.com"),
     os.environ.get("GITHUB_REPOSITORY", ""),
@@ -406,6 +407,7 @@ else:
 run_entry = {
     "run_id":              run_number,
     "run_url":             run_url,
+    "branch":              branch_name,
     "timestamp":           datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "total":               agg["expected"] + agg["unexpected"] + agg["flaky"] + agg["skipped"],
     "passed":              agg["expected"],
@@ -472,7 +474,11 @@ pruned = prev_count - len(store["runs"])
 if pruned > 0:
     print(f"[stats] Pruned {pruned} run(s) (duplicate run_id or older than 30 days)")
 
-previous_run = max(store["runs"], key=lambda r: r["timestamp"], default=None)
+previous_run = max(
+    (r for r in store["runs"] if r.get("branch", "") == branch_name),
+    key=lambda r: r["timestamp"],
+    default=None,
+)
 previous_tests = None
 if previous_run is not None and isinstance(previous_run.get("tests"), list):
     previous_tests = {
@@ -564,6 +570,79 @@ def flaky_counts(runs):
             counts[k] = max(counts.get(k, 0), c)
     return sorted(counts.items(), key=lambda x: (-x[1], x[0]))
 
+def dashboard_stats(selected_runs):
+    eligible_runs = [run for run in selected_runs if not is_all_failed_run(run)]
+    total_executed = sum(
+        max(0, total_tests(run) - run.get("skipped", 0) - run.get("shell_skipped", 0))
+        for run in eligible_runs
+    )
+    total_passed = sum(
+        run.get("passed", 0) + run.get("shell_passed", 0) + run.get("flaky_count", 0)
+        for run in eligible_runs
+    )
+    total_failed = sum(
+        run.get("failed", 0) + run.get("shell_failed", 0) for run in eligible_runs
+    )
+    total_flaky = sum(run.get("flaky_count", 0) for run in eligible_runs)
+    durations = [
+        run.get("duration_ms", 0)
+        for run in eligible_runs
+        if run.get("duration_ms", 0) > 0
+    ]
+
+    slow_by_test = {}
+    retry_by_test = {}
+    for run in eligible_runs:
+        for test in run.get("slowest_tests", []):
+            slow_by_test[test["title"]] = max(
+                slow_by_test.get(test["title"], 0), test["duration_ms"]
+            )
+        for test in run.get("tests", []):
+            retries = test.get("retries", 0)
+            if retries > 0:
+                retry_by_test[test["title"]] = retry_by_test.get(test["title"], 0) + retries
+        if not any("retries" in test for test in run.get("tests", [])):
+            for test in run.get("flaky_tests", []):
+                retries = test.get("retries", max(0, test.get("attempts", 1) - 1))
+                if retries > 0:
+                    retry_by_test[test["title"]] = retry_by_test.get(test["title"], 0) + retries
+
+    return {
+        "run_count": len(selected_runs),
+        "pass_rate": round(
+            100 * (1 - total_failed / max(1, sum(total_tests(run) for run in eligible_runs))),
+            1,
+        ),
+        "avg_total": int(round(total_executed / max(1, len(eligible_runs)))),
+        "avg_passed": int(round(total_passed / max(1, len(eligible_runs)))),
+        "avg_failed": round(total_failed / max(1, len(eligible_runs)), 1),
+        "avg_flaky": round(total_flaky / max(1, len(eligible_runs)), 1),
+        "avg_retries": round(
+            sum(retry_count(run) for run in eligible_runs) / max(1, len(eligible_runs)), 1
+        ),
+        "avg_duration_ms": (
+            int(round(sum(durations) / len(durations))) if durations else 0
+        ),
+        "min_duration_ms": min(durations, default=0),
+        "max_duration_ms": max(durations, default=0),
+        "agg": {
+            "top": [[title, count] for title, count in top_failing(selected_runs, 5)],
+            "flaky": [[title, count] for title, count in flaky_counts(selected_runs)[:5]],
+            "slow": [
+                [title, duration]
+                for title, duration in sorted(
+                    slow_by_test.items(), key=lambda item: -item[1]
+                )[:5]
+            ],
+            "retried": [
+                [title, count]
+                for title, count in sorted(
+                    retry_by_test.items(), key=lambda item: -item[1]
+                )[:5]
+            ],
+        },
+    }
+
 def short_name(title):
     parts = [p.strip() for p in title.split(">") if p.strip()]
     if len(parts) >= 2:
@@ -577,8 +656,20 @@ def esc(s):
 
 runs      = store["runs"]
 eligible  = [r for r in runs if not is_all_failed_run(r)]
-top       = top_failing(runs, 5)
-flaky     = flaky_counts(runs)
+branch_names = sorted({
+    run.get("branch")
+    for run in runs
+    if isinstance(run.get("branch"), str) and run.get("branch")
+})
+filter_stats = {"all": dashboard_stats(runs)}
+for branch_name in branch_names:
+    filter_stats["branch:" + branch_name] = dashboard_stats([
+        run for run in runs if run.get("branch") == branch_name
+    ])
+if any(not isinstance(run.get("branch"), str) or not run.get("branch") for run in runs):
+    filter_stats["unknown"] = dashboard_stats([
+        run for run in runs if not isinstance(run.get("branch"), str) or not run.get("branch")
+    ])
 
 total_executed = sum(max(0, total_tests(r) - r.get("skipped", 0) - r.get("shell_skipped", 0)) for r in eligible)
 total_passed   = sum(r.get("passed", 0) + r.get("shell_passed", 0) + r.get("flaky_count", 0) for r in eligible)
@@ -601,28 +692,6 @@ def fmt_dur(ms):
     s = ms / 1000
     if s < 60: return f"{s:.0f}s"
     return f"{int(s // 60)}m {int(s % 60)}s"
-
-slow_by_test = {}
-for _r in eligible:
-    for _t in _r.get("slowest_tests", []):
-        k = _t["title"]
-        slow_by_test[k] = max(slow_by_test.get(k, 0), _t["duration_ms"])
-top_slow = sorted(slow_by_test.items(), key=lambda x: -x[1])[:5]
-
-retry_by_test = {}
-for _r in eligible:
-    for _t in _r.get("tests", []):
-        retries = _t.get("retries", 0)
-        if retries > 0:
-            k = _t["title"]
-            retry_by_test[k] = retry_by_test.get(k, 0) + retries
-    if not any("retries" in _t for _t in _r.get("tests", [])):
-        for _t in _r.get("flaky_tests", []):
-            retries = _t.get("retries", max(0, _t.get("attempts", 1) - 1))
-            if retries > 0:
-                k = _t["title"]
-                retry_by_test[k] = retry_by_test.get(k, 0) + retries
-most_retried = sorted(retry_by_test.items(), key=lambda x: -x[1])[:5]
 
 total_retries = sum(retry_count(r) for r in eligible)
 avg_retries = round(total_retries / max(1, len(eligible)), 1)
@@ -762,6 +831,17 @@ a{{color:#2563eb;text-decoration:none}}a:hover{{text-decoration:underline}}
         fh.write('<div class="card">\n')
         # Select a run before showing its test list; newest run is selected by default.
         fh.write('<div class="section-lbl">Tests in selected run</div>\n')
+        fh.write('<label for="branch-picker" class="section-lbl">Branch</label>\n')
+        fh.write('<select id="branch-picker" aria-label="Filter by branch" '
+                 'style="font-size:.8rem;padding:.35rem .6rem;border:1px solid #e2e8f0;'
+                 'border-radius:.4rem;background:#fff;color:#374151;width:100%;'
+                 'max-width:42rem;cursor:pointer">\n')
+        fh.write('<option value="all">All branches</option>\n')
+        for _branch in branch_names:
+            fh.write(f'<option value="{esc("branch:" + _branch)}">{esc(_branch)}</option>\n')
+        if "unknown" in filter_stats:
+            fh.write('<option value="unknown">Unknown branch</option>\n')
+        fh.write('</select>\n')
         fh.write('<select id="run-picker" style="font-size:.8rem;padding:.35rem .6rem;border:1px solid #e2e8f0;border-radius:.4rem;background:#fff;color:#374151;width:100%;max-width:42rem;cursor:pointer">\n')
         for _i, _run in enumerate(reversed(runs[-20:])):
             _orig_idx = len(runs) - 1 - _i
@@ -788,12 +868,16 @@ a{{color:#2563eb;text-decoration:none}}a:hover{{text-decoration:underline}}
         fh.write('<div id="test-detail" aria-live="polite"></div>\n')
         fh.write('<div id="run-detail" style="margin-top:.875rem"></div>\n')
         _runs_store_json = json.dumps(store).replace('</', '<\\/')
-        _runs_json = json.dumps(runs).replace('</', '<\\/')
-        fh.write(f'<script>var RUNS_STORE={_runs_store_json};var RUNS=RUNS_STORE.runs;</script>\n')
+        _filter_stats_json = json.dumps(filter_stats).replace('</', '<\\/')
+        fh.write(
+            f'<script>var RUNS_STORE={_runs_store_json};var RUNS=RUNS_STORE.runs;'
+            f'var FILTER_STATS={_filter_stats_json};</script>\n'
+        )
         fh.write('''\
 <script>
 (function(){
   var picker=document.getElementById('run-picker');
+  var branchPicker=document.getElementById('branch-picker');
   var runPagePrev=document.getElementById('run-page-prev');
   var runPageNext=document.getElementById('run-page-next');
   var runPageRange=document.getElementById('run-page-range');
@@ -801,6 +885,7 @@ a{{color:#2563eb;text-decoration:none}}a:hover{{text-decoration:underline}}
   var detail=document.getElementById('run-detail');
   var runPageSize=20;
   var runPage=0;
+  var visibleRunIndices=[];
   var cookiePath=location.pathname.slice(0,location.pathname.lastIndexOf('/')+1)||'/';
   var cookieName='testStatsPrefs_'+cookiePath.replace(/[^a-zA-Z0-9]/g,'_');
   function readPrefs(){
@@ -837,7 +922,8 @@ a{{color:#2563eb;text-decoration:none}}a:hover{{text-decoration:underline}}
       'test-filter-source':checkedValues('test-filter-source'),
       'test-filter-status':checkedValues('test-filter-status'),
       'test-filter-change':checkedValues('test-filter-change'),
-      aggPicker:latestPrefs.aggPicker||savedPrefs.aggPicker||'top'
+      aggPicker:latestPrefs.aggPicker||savedPrefs.aggPicker||'top',
+      branch:branchPicker.value
     };
     var aggPicker=document.getElementById('agg-picker');
     if(aggPicker&&['top','flaky','longest','retried'].indexOf(aggPicker.value)!==-1){prefs.aggPicker=aggPicker.value;}
@@ -867,8 +953,8 @@ a{{color:#2563eb;text-decoration:none}}a:hover{{text-decoration:underline}}
   function getTestExecutions(test){
     var identity=testIdentity(test);
     var executions=[];
-    for(var r=RUNS.length-1;r>=0&&executions.length<20;r--){
-      var run=RUNS[r];
+    for(var r=visibleRunIndices.length-1;r>=0&&executions.length<20;r--){
+      var run=RUNS[visibleRunIndices[r]];
       var match=null;
       var tests=run.tests||[];
       for(var i=0;i<tests.length;i++){
@@ -1276,30 +1362,111 @@ a{{color:#2563eb;text-decoration:none}}a:hover{{text-decoration:underline}}
     var ts=(run.timestamp||'').slice(0,16).replace('T',' ');
     var failed=(run.failed||0)+(run.shell_failed||0);
     var status=failed===0?'✓':'✗';
-    return status+' Run #'+run.run_id+' — '+ts+'Z'
+    var label=status+' Run #'+run.run_id+' — '+ts+'Z'
       +' — '+((run.passed||0)+(run.flaky_count||0)+(run.shell_passed||0))+'p / '+failed+'f'
       +' / '+(run.passed_after_retry_count||run.flaky_count||0)+' passed after retry'
       +' / '+runRetryCount(run)+' retries'
       +' / '+((run.skipped||0)+(run.shell_skipped||0))+' skipped';
+    if(branchPicker.value==='all'){label+=' — '+(run.branch||'Unknown branch');}
+    return label;
+  }
+  function updateOverview(){
+    var stats=FILTER_STATS[branchPicker.value]||FILTER_STATS.all;
+    var heading=document.getElementById('overview-title');
+    var rate=document.getElementById('overview-pass-rate');
+    heading.textContent='Last 30 days — '+stats.run_count+' run(s)';
+    rate.textContent=stats.pass_rate+'% pass rate';
+    rate.className='rate-pill '+(stats.pass_rate>=90?'rate-ok':(stats.pass_rate>=70?'rate-warn':'rate-bad'));
+    document.getElementById('overview-avg-total').textContent=stats.avg_total;
+    document.getElementById('overview-avg-passed').textContent=stats.avg_passed;
+    document.getElementById('overview-avg-failed').textContent=stats.avg_failed;
+    document.getElementById('overview-avg-flaky').textContent=stats.avg_flaky;
+    document.getElementById('overview-avg-retries').textContent=stats.avg_retries;
+    var durationStats=document.getElementById('overview-duration-stats');
+    durationStats.style.display=stats.max_duration_ms?'grid':'none';
+    var durationLabel=document.getElementById('overview-duration-label');
+    if(durationLabel){durationLabel.style.display=stats.max_duration_ms?'':'none';}
+    document.getElementById('overview-avg-duration').textContent=fmtDur(stats.avg_duration_ms);
+    document.getElementById('overview-min-duration').textContent=fmtDur(stats.min_duration_ms);
+    document.getElementById('overview-max-duration').textContent=fmtDur(stats.max_duration_ms);
+    var selectedRuns=visibleRunIndices.map(function(index){return RUNS[index];});
+    var maxTotal=Math.max.apply(null,selectedRuns.map(function(run){
+      return (run.total||0)+(run.shell_passed||0)+(run.shell_failed||0)+(run.shell_skipped||0);
+    }).concat([1]));
+    var bars=[];
+    for(var i=selectedRuns.length-1;i>=0;i--){
+      var run=selectedRuns[i];
+      var pwFailed=run.failed||0,pwFlaky=run.flaky_count||0,shFailed=run.shell_failed||0;
+      var issues=pwFailed+pwFlaky+shFailed;
+      var runTotal=(run.total||0)+(run.shell_passed||0)+(run.shell_failed||0)+(run.shell_skipped||0);
+      var height=Math.max(8,Math.round(60*runTotal/maxTotal));
+      var color;
+      if(isAllFailedRun(run)){color='#1e293b';}
+      else if(issues===0){color='#22c55e';}
+      else if(pwFailed>0&&pwFlaky>0){
+        var redPct=Math.round(100*pwFailed/issues*10)/10;
+        color='linear-gradient(to top,#eab308 0%,#eab308 '+(100-redPct)+'%,#ef4444 '+(100-redPct)+'%)';
+      }else if(pwFailed>0||shFailed>0){color='#ef4444';}
+      else{color='#eab308';}
+      var duration=run.duration_ms>0?' — ⏱ '+fmtDur(run.duration_ms):'';
+      var label='Run #'+run.run_id+duration+' — '
+        +((run.passed||0)+(run.shell_passed||0))+' passed / '+(pwFailed+shFailed)+' failed / '
+        +(run.passed_after_retry_count||pwFlaky)+' passed after retry / '
+        +runRetryCount(run)+' retries / '+((run.skipped||0)+(run.shell_skipped||0))+' skipped'
+        +' — '+(run.branch||'Unknown branch');
+      bars.push('<a href="'+esc(run.run_url||'#')+'" target="_blank" title="'+esc(label)+'">'
+        +'<div class="bar" style="height:'+height+'px;background:'+color+'"></div></a>');
+    }
+    document.getElementById('run-sparkline').innerHTML=bars.join('');
+  }
+  function isAllFailedRun(run){
+    var total=(run.total||0)+(run.shell_passed||0)+(run.shell_failed||0)+(run.shell_skipped||0);
+    var skipped=(run.skipped||0)+(run.shell_skipped||0);
+    var executed=Math.max(0,total-skipped);
+    var failed=(run.failed||0)+(run.shell_failed||0);
+    return executed>0&&failed>=executed;
+  }
+  function setBranch(value,persist){
+    if(!FILTER_STATS[value]){value='all';}
+    branchPicker.value=value;
+    visibleRunIndices=[];
+    for(var i=0;i<RUNS.length;i++){
+      var runBranch=typeof RUNS[i].branch==='string'?RUNS[i].branch:'';
+      if(value==='all'
+        ||(value==='unknown'&&!runBranch)
+        ||(value.indexOf('branch:')===0&&runBranch===value.slice(7))){
+        visibleRunIndices.push(i);
+      }
+    }
+    updateOverview();
+    runPage=0;
+    renderRunPage(0,visibleRunIndices.length?visibleRunIndices[visibleRunIndices.length-1]:-1);
+    if(window.refreshBranchTrends){window.refreshBranchTrends(FILTER_STATS[value].agg);}
+    if(persist){savePrefs();}
   }
   function renderRunPage(page,selectedIndex){
-    var pageCount=Math.ceil(RUNS.length/runPageSize);
+    var pageCount=Math.max(1,Math.ceil(visibleRunIndices.length/runPageSize));
     runPage=Math.max(0,Math.min(page,pageCount-1));
-    var newestIndex=RUNS.length-1-runPage*runPageSize;
-    var oldestIndex=Math.max(0,newestIndex-runPageSize+1);
+    var newestPosition=visibleRunIndices.length-1-runPage*runPageSize;
+    var oldestPosition=Math.max(0,newestPosition-runPageSize+1);
     var options=[];
-    for(var i=newestIndex;i>=oldestIndex;i--){
-      options.push('<option value="'+i+'">'+esc(runLabel(RUNS[i]))+'</option>');
+    for(var i=newestPosition;i>=oldestPosition;i--){
+      var runIndex=visibleRunIndices[i];
+      options.push('<option value="'+runIndex+'">'+esc(runLabel(RUNS[runIndex]))+'</option>');
     }
     picker.innerHTML=options.join('');
-    if(selectedIndex<oldestIndex||selectedIndex>newestIndex){selectedIndex=newestIndex;}
+    if(oldestPosition<0){selectedIndex=-1;}
+    else if(visibleRunIndices.indexOf(selectedIndex)<oldestPosition
+      ||visibleRunIndices.indexOf(selectedIndex)>newestPosition){
+      selectedIndex=visibleRunIndices[newestPosition];
+    }
     picker.value=String(selectedIndex);
     var firstRun=runPage*runPageSize+1;
-    var lastRun=firstRun+(newestIndex-oldestIndex);
-    runPageRange.textContent='Runs '+firstRun+'-'+lastRun+' of '+RUNS.length+' (newest first)';
+    var lastRun=firstRun+Math.max(0,newestPosition-oldestPosition);
+    runPageRange.textContent='Runs '+firstRun+'-'+lastRun+' of '+visibleRunIndices.length+' (newest first)';
     runPagePrev.disabled=runPage===0;
     runPageNext.disabled=runPage>=pageCount-1;
-    renderRun(RUNS[selectedIndex]);
+    renderRun(selectedIndex>=0?RUNS[selectedIndex]:null);
   }
   document.getElementById('reset-dashboard-preferences').addEventListener('click',function(){
     document.cookie=cookieName+'=; Path='+cookiePath+'; Max-Age=0; SameSite=Lax';
@@ -1317,74 +1484,42 @@ a{{color:#2563eb;text-decoration:none}}a:hover{{text-decoration:underline}}
     URL.revokeObjectURL(url);
   });
   picker.addEventListener('change',function(){renderRun(RUNS[parseInt(this.value,10)]);});
+  branchPicker.addEventListener('change',function(){setBranch(this.value,true);});
   runPagePrev.addEventListener('click',function(){renderRunPage(runPage-1,-1);});
   runPageNext.addEventListener('click',function(){renderRunPage(runPage+1,-1);});
-  renderRunPage(0,RUNS.length-1);
+  window.initializeBranchDashboard=function(){
+    setBranch(FILTER_STATS[savedPrefs.branch]?savedPrefs.branch:'all',false);
+  };
 })();
 </script>
 ''')
-        fh.write(f'<div class="card-header"><h2 class="card-title">Last 30 days &mdash; {len(runs)} run(s)</h2>')
-        fh.write(f'<span class="rate-pill {rate_cls}">{pass_rate}% pass rate</span></div>\n')
-
+        fh.write(f'<div class="card-header"><h2 class="card-title" id="overview-title">Last 30 days &mdash; {len(runs)} run(s)</h2>')
+        fh.write(f'<span class="rate-pill {rate_cls}" id="overview-pass-rate">{pass_rate}% pass rate</span></div>\n')
         fh.write('<div class="section-lbl">Test results (all configured sources)</div>\n')
         fh.write('<div class="stats-row">\n')
-        fh.write(f'<div class="stat-box"><div class="stat-val">{avg_total}</div><div class="stat-lbl">Avg tests/run</div></div>\n')
-        fh.write(f'<div class="stat-box"><div class="stat-val">{avg_passed}</div><div class="stat-lbl">Avg passed/run</div></div>\n')
-        fh.write(f'<div class="stat-box stat-fail"><div class="stat-val">{avg_failed:g}</div><div class="stat-lbl">Avg failures/run</div></div>\n')
-        fh.write(f'<div class="stat-box stat-flaky"><div class="stat-val">{avg_flaky:g}</div><div class="stat-lbl">Avg passed after retry/run</div></div>\n')
-        fh.write(f'<div class="stat-box"><div class="stat-val">{avg_retries:g}</div><div class="stat-lbl">Avg retries/run</div></div>\n')
+        fh.write(f'<div class="stat-box"><div class="stat-val" id="overview-avg-total">{avg_total}</div><div class="stat-lbl">Avg tests/run</div></div>\n')
+        fh.write(f'<div class="stat-box"><div class="stat-val" id="overview-avg-passed">{avg_passed}</div><div class="stat-lbl">Avg passed/run</div></div>\n')
+        fh.write(f'<div class="stat-box stat-fail"><div class="stat-val" id="overview-avg-failed">{avg_failed:g}</div><div class="stat-lbl">Avg failures/run</div></div>\n')
+        fh.write(f'<div class="stat-box stat-flaky"><div class="stat-val" id="overview-avg-flaky">{avg_flaky:g}</div><div class="stat-lbl">Avg passed after retry/run</div></div>\n')
+        fh.write(f'<div class="stat-box"><div class="stat-val" id="overview-avg-retries">{avg_retries:g}</div><div class="stat-lbl">Avg retries/run</div></div>\n')
         fh.write('</div>\n')
         if any(durations):
-            fh.write('<div class="section-lbl">Execution time</div>\n')
-            fh.write('<div class="stats-row duration-stats">\n')
-            fh.write(f'<div class="stat-box"><div class="stat-val">{fmt_dur(avg_dur_ms)}</div><div class="stat-lbl">Avg run time</div></div>\n')
-            fh.write(f'<div class="stat-box"><div class="stat-val">{fmt_dur(min_dur_ms)}</div><div class="stat-lbl">Fastest run</div></div>\n')
-            fh.write(f'<div class="stat-box"><div class="stat-val">{fmt_dur(max_dur_ms)}</div><div class="stat-lbl">Slowest run</div></div>\n')
+            fh.write('<div class="section-lbl" id="overview-duration-label">Execution time</div>\n')
+            fh.write('<div class="stats-row duration-stats" id="overview-duration-stats">\n')
+            fh.write(f'<div class="stat-box"><div class="stat-val" id="overview-avg-duration">{fmt_dur(avg_dur_ms)}</div><div class="stat-lbl">Avg run time</div></div>\n')
+            fh.write(f'<div class="stat-box"><div class="stat-val" id="overview-min-duration">{fmt_dur(min_dur_ms)}</div><div class="stat-lbl">Fastest run</div></div>\n')
+            fh.write(f'<div class="stat-box"><div class="stat-val" id="overview-max-duration">{fmt_dur(max_dur_ms)}</div><div class="stat-lbl">Slowest run</div></div>\n')
             fh.write('</div>\n')
-
-        max_total = max((total_tests(r) for r in runs), default=1) or 1
+        else:
+            fh.write('<div class="stats-row duration-stats" id="overview-duration-stats" style="display:none">\n')
+            fh.write('<div class="stat-box"><div class="stat-val" id="overview-avg-duration">—</div><div class="stat-lbl">Avg run time</div></div>\n')
+            fh.write('<div class="stat-box"><div class="stat-val" id="overview-min-duration">—</div><div class="stat-lbl">Fastest run</div></div>\n')
+            fh.write('<div class="stat-box"><div class="stat-val" id="overview-max-duration">—</div><div class="stat-lbl">Slowest run</div></div>\n')
+            fh.write('</div>\n')
         fh.write('<div class="spark-label">Tests per run (all configured sources) — color shows pass/fail</div>\n')
-        fh.write('<div class="sparkline" title="Total tests per run (newest → oldest)">')
-        for run in reversed(runs):
-            pw_failed   = run["failed"]
-            pw_flaky    = run.get("flaky_count", 0)
-            sh_failed   = run.get("shell_failed", 0)
-            issues      = pw_failed + pw_flaky + sh_failed
-            run_total   = total_tests(run)
-            h           = max(8, round(60 * run_total / max_total))
-            if is_all_failed_run(run):
-                color = "#1e293b"
-            elif issues == 0:
-                color = "#22c55e"
-            elif pw_failed > 0 and pw_flaky > 0:
-                red_pct    = round(100 * pw_failed / issues, 1)
-                yellow_pct = 100 - red_pct
-                color = f"linear-gradient(to top,#eab308 0%,#eab308 {yellow_pct}%,#ef4444 {yellow_pct}%)"
-            elif pw_failed > 0 or sh_failed > 0:
-                color = "#ef4444"
-            else:
-                color = "#eab308"
-            dur_label = f" — ⏱ {fmt_dur(run.get('duration_ms', 0))}" if run.get("duration_ms", 0) > 0 else ""
-            label = (
-                f"Run #{run['run_id']}{dur_label} — "
-                f"{run.get('passed', 0) + run.get('shell_passed', 0)} passed / "
-                f"{pw_failed + sh_failed} failed / "
-                f"{run.get('passed_after_retry_count', pw_flaky)} passed after retry / "
-                f"{retry_count(run)} retries / "
-                f"{run.get('skipped', 0) + run.get('shell_skipped', 0)} skipped"
-            )
-            fh.write(
-                f'<a href="{esc(run["run_url"])}" target="_blank" title="{esc(label)}">'
-                f'<div class="bar" style="height:{h}px;background:{color}"></div></a>'
-            )
-        fh.write('</div>\n')
+        fh.write('<div class="sparkline" id="run-sparkline" title="Total tests per run (newest → oldest)"></div>\n')
 
         # Aggregate test trends picker
-        _agg_top     = [[t, c] for t, c in top]
-        _agg_flaky   = [[t, c] for t, c in flaky[:5]]
-        _agg_slow    = [[t, d] for t, d in top_slow]
-        _agg_retried = [[t, c] for t, c in most_retried]
-        _agg_json    = json.dumps({"top": _agg_top, "flaky": _agg_flaky, "slow": _agg_slow, "retried": _agg_retried}).replace('</', '<\\/')
         fh.write('<div class="section-lbl">Test trends (last 30 days)</div>\n')
         fh.write('<select id="agg-picker" style="font-size:.8rem;padding:.35rem .6rem;border:1px solid #e2e8f0;border-radius:.4rem;background:#fff;color:#374151;width:100%;max-width:42rem;cursor:pointer">\n')
         fh.write('<option value="top">Top failing tests</option>\n')
@@ -1393,6 +1528,7 @@ a{{color:#2563eb;text-decoration:none}}a:hover{{text-decoration:underline}}
         fh.write('<option value="retried">Most retried</option>\n')
         fh.write('</select>\n')
         fh.write('<div id="agg-detail" style="margin-top:.5rem"></div>\n')
+        _agg_json = json.dumps(filter_stats["all"]["agg"]).replace('</', '<\\/')
         fh.write(f'<script>var AGG={_agg_json};</script>\n')
         fh.write('''\
 <script>
@@ -1458,15 +1594,28 @@ a{{color:#2563eb;text-decoration:none}}a:hover{{text-decoration:underline}}
     box.innerHTML=html;
     highlightTests(v);
   }
+  window.refreshBranchTrends=function(agg){
+    AGG=agg;
+    render(sel.value);
+  };
   sel.addEventListener('change',function(){
     render(this.value);
-    prefs.aggPicker=this.value;
-    document.cookie=cookieName+'='+encodeURIComponent(JSON.stringify(prefs))+'; Path='+cookiePath+'; Max-Age=31536000; SameSite=Lax';
+    var latestPrefs={},latestCookies=document.cookie.split(';');
+    for(var i=0;i<latestCookies.length;i++){
+      var item=latestCookies[i].trim();
+      if(item.indexOf(prefix)===0){
+        try{latestPrefs=JSON.parse(decodeURIComponent(item.slice(prefix.length)))||{};}catch(error){latestPrefs={};}
+        break;
+      }
+    }
+    latestPrefs.aggPicker=this.value;
+    document.cookie=cookieName+'='+encodeURIComponent(JSON.stringify(latestPrefs))+'; Path='+cookiePath+'; Max-Age=31536000; SameSite=Lax';
   });
   render(sel.value);
 })();
 </script>
 ''')
+        fh.write('<script>window.initializeBranchDashboard();</script>\n')
 
         fh.write('</div>\n')
 

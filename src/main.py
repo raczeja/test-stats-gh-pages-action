@@ -429,12 +429,13 @@ def make_dashboard(store_path, runs, name, window_days):
             f"<td><a href=\"{html.escape(run_link, quote=True)}\">"
             f"Run #{html.escape(str(run.get('run_id', '')))}</a></td>"
             f"<td>{html.escape(run.get('timestamp', ''))}</td>"
+            f"<td>{html.escape(str(run.get('branch') or '—'))}</td>"
             f"<td>{run.get('passed', 0)}</td>"
             f"<td>{run.get('failed', 0)}</td>"
             f"<td>{run.get('skipped', 0)}</td>"
             f"<td>{run.get('total', 0)}</td></tr>"
         )
-    table_rows = "\n".join(rows) or '<tr><td colspan="6">No test runs in this window.</td></tr>'
+    table_rows = "\n".join(rows) or '<tr><td colspan="7">No test runs in this window.</td></tr>'
     dashboard = store_path.parent / "index.html"
     dashboard.write_text(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
@@ -444,7 +445,7 @@ def make_dashboard(store_path, runs, name, window_days):
         "table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:.6rem;border-bottom:1px solid #ddd}"
         "th{background:#f5f5f5}a{color:#2563eb}</style></head><body>"
         f"<h1>{html.escape(name)} — last {window_days} days</h1>"
-        "<table><thead><tr><th>Run</th><th>Timestamp</th><th>Passed</th>"
+        "<table><thead><tr><th>Run</th><th>Timestamp</th><th>Branch</th><th>Passed</th>"
         "<th>Failed</th><th>Skipped</th><th>Total</th></tr></thead>"
         f"<tbody>{table_rows}</tbody></table></body></html>\n",
         encoding="utf-8",
@@ -468,6 +469,7 @@ def main():
             f"{env('GITHUB_SERVER_URL', 'https://github.com')}/"
             f"{env('GITHUB_REPOSITORY')}/actions/runs/{env('GITHUB_RUN_ID', '0')}"
         ),
+        "branch": env("GITHUB_HEAD_REF") or env("GITHUB_REF_NAME"),
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "total": 0, "passed": 0, "failed": 0, "skipped": 0, "flaky_count": 0,
         "duration_ms": 0, "sources": [],

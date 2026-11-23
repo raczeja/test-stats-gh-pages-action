@@ -208,6 +208,8 @@ class StatsActionTests(unittest.TestCase):
                 "INPUT_DASHBOARD_URL": "https://owner.github.io/repo/reusable-stats/",
                 "GITHUB_RUN_NUMBER": "42",
                 "GITHUB_RUN_ID": "42",
+                "GITHUB_REF_NAME": "feature/test-stats",
+                "GITHUB_HEAD_REF": "feature/head",
                 "GITHUB_SERVER_URL": "https://github.com",
                 "GITHUB_REPOSITORY": "owner/repo",
                 "GITHUB_OUTPUT": str(output),
@@ -218,7 +220,10 @@ class StatsActionTests(unittest.TestCase):
             stored = json.loads(runs_path.read_text())
             self.assertEqual(stored["schemaVersion"], 1)
             self.assertEqual([item["run_id"] for item in stored["runs"]], ["recent", "42"])
-            self.assertTrue((runs_path.parent / "index.html").is_file())
+            self.assertEqual(stored["runs"][-1]["branch"], "feature/head")
+            dashboard = (runs_path.parent / "index.html").read_text()
+            self.assertIn("<th>Branch</th>", dashboard)
+            self.assertIn("<td>feature/head</td>", dashboard)
             self.assertIn("passed**", summary.read_text())
             self.assertIn(
                 "[View test statistics dashboard](https://owner.github.io/repo/reusable-stats/)",
